@@ -111,12 +111,14 @@ def load_json(path, default):
         return dict(default)
 
 
-def save_json(path, data):
+def save_json(path, data, mode=0o644):
+    # Root-owned either way; 0644 lets unprivileged `status` read. Only
+    # codes.json (crackable-offline hashes) needs 0600.
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
-    os.chmod(tmp, 0o600)
+    os.chmod(tmp, mode)
     os.replace(tmp, path)
 
 
@@ -155,12 +157,16 @@ def gen_batch():
         salt = secrets.token_hex(16)
         plain.append(code)
         stored.append({"salt": salt, "hash": hash_code(salt, code), "used": False})
-    save_json(CODES, {"codes": stored})
+    save_json(CODES, {"codes": stored}, mode=0o600)
     return plain
 
 
 def codes_remaining():
-    data = load_json(CODES, {"codes": []})
+    """Unused-code count, or None when codes.json isn't readable (no sudo)."""
+    try:
+        data = load_json(CODES, {"codes": []})
+    except PermissionError:
+        return None
     return sum(1 for c in data["codes"] if not c["used"])
 
 
@@ -174,7 +180,7 @@ def verify_and_burn(code):
     for entry in data["codes"]:
         if not entry["used"] and entry["hash"] == hash_code(entry["salt"], code):
             entry["used"] = True
-            save_json(CODES, data)
+            save_json(CODES, data, mode=0o600)
             return True
     state["last_fail"] = time.time()
     save_json(STATE, state)
@@ -203,8 +209,9 @@ def emergency_deadline(config, state):
     return state["emergency_at"] + config.get("emergency_delay_hours", 24) * 3600
 
 
-def settle(config, state):
-    """Apply timer expiries. Returns True if state changed."""
+def settle(config, state, persist=True):
+    """Apply timer expiries. persist=False mutates in memory only (for
+    unprivileged `status`; the daemon persists on its next wake)."""
     now = time.time()
     changed = False
     dl = emergency_deadline(config, state)
@@ -212,12 +219,14 @@ def settle(config, state):
         state["armed"] = False
         state["emergency_at"] = None
         changed = True
-        log("emergency cooling-off elapsed → DISARMED")
+        if persist:
+            log("emergency cooling-off elapsed → DISARMED")
     if state.get("pause_until") and now >= state["pause_until"]:
         state["pause_until"] = None
         changed = True
-        log("pause expired → re-armed")
-    if changed:
+        if persist:
+            log("pause expired → re-armed")
+    if changed and persist:
         save_json(STATE, state)
     return changed
 
@@ -421,8 +430,12 @@ def fmt_ts(ts):
 
 
 def cmd_status(args):
-    config, state = load_all()
-    settle(config, state)
+    try:
+        config, state = load_all()
+    except PermissionError:
+        die("state files aren't readable — re-run `./guardian.py install` once "
+            "to fix permissions (or use `sudo guardian status`)")
+    settle(config, state, persist=(TESTING or os.geteuid() == 0))
     if state.get("emergency_at") is not None:
         dl = emergency_deadline(config, state)
         mode = "COOLING-OFF → disarms %s" % fmt_ts(dl)
@@ -436,7 +449,10 @@ def cmd_status(args):
     print("blocked domains (%d): %s" % (
         len(config["domains"]), ", ".join(sorted(config["domains"])) or "—"))
     left = codes_remaining()
-    print("unlock codes remaining: %d%s" % (left, "  ⚠ regenerate soon" if left < 5 else ""))
+    if left is None:
+        print("unlock codes remaining: (visible with sudo)")
+    else:
+        print("unlock codes remaining: %d%s" % (left, "  ⚠ regenerate soon" if left < 5 else ""))
 
 
 def parse_duration(s):
@@ -596,6 +612,9 @@ def cmd_install(args):
         plistlib.dump(plist_dict(), f)
     shutil.copyfile(CANONICAL_PLIST, PLIST)
     os.chmod(PLIST, 0o644)
+    for path, mode in ((CONFIG, 0o644), (STATE, 0o644), (CODES, 0o600)):
+        if os.path.exists(path):
+            os.chmod(path, mode)
     if not TESTING:
         if os.path.islink(BIN_LINK) or os.path.exists(BIN_LINK):
             os.remove(BIN_LINK)
