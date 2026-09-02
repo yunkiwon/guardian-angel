@@ -536,6 +536,25 @@ def cmd_pause(args):
     print("paused until %s — auto re-arms" % fmt_ts(state["pause_until"]))
 
 
+def cmd_delay(args):
+    if not args:
+        die("usage: guardian delay <30m|2h|24h>")
+    need_root()
+    config, state = load_all()
+    secs = parse_duration(args[0])
+    if secs < 30 * 60:
+        die("minimum emergency delay is 30m")
+    current = config.get("emergency_delay_hours", 24) * 3600
+    if secs < current and is_active(state):
+        # Shortening the hatch is loosening — free shortening would be
+        # a self-serve bypass of the whole cooling-off idea.
+        require_code("shorten the emergency delay to %s" % args[0])
+    config["emergency_delay_hours"] = secs / 3600
+    save_json(CONFIG, config)
+    print("emergency delay is now %s%s" % (
+        args[0], "" if secs >= current else " — shorter hatch, weaker guardian; your call"))
+
+
 def cmd_emergency(args):
     need_root()
     config, state = load_all()
@@ -670,6 +689,7 @@ COMMANDS = {
     "disarm": cmd_disarm,
     "pause": cmd_pause,
     "emergency": cmd_emergency,
+    "delay": cmd_delay,
     "init": cmd_init,
     "regen": cmd_regen,
     "install": cmd_install,
@@ -685,7 +705,8 @@ USAGE = """guardian — network-level site blocking with friend-held keys
   pause <30m|2h>          bounded window, auto re-arms           one code
   remove <domain>         unblock a domain                       one code
   disarm                  enforcement off until re-armed         one code
-  emergency [cancel]      no code — disarm lands in 24h          time
+  emergency [cancel]      no code — disarm lands after the delay time
+  delay <30m|2h|24h>      set the emergency delay                raise free / lower one code
   init | regen            create / rotate the one-time codes
   install | uninstall     manage the daemon (uninstall: DISARMED only)
 """
