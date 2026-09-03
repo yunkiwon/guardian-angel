@@ -63,6 +63,22 @@ block return out quick proto { tcp udp } to any port 853
 block return out quick proto tcp to <doh> port 443
 """
 
+FAMILY_DNS = ["1.1.1.3", "1.0.0.3", "2606:4700:4700::1113", "2606:4700:4700::1003"]
+
+# Appended to pf.rules while the nsfw filter is on. The DNS pin in System
+# Settings makes name resolution *work*; these rules make it *mandatory* —
+# pointing DNS anywhere else fails closed instead of bypassing the filter.
+FILTER_RULES_TEXT = """\
+table <familydns> { %s }
+pass out quick proto { tcp udp } to <familydns> port 53
+block return out quick proto { tcp udp } to any port 53
+""" % ", ".join(FAMILY_DNS)
+
+
+def pf_rules_text(filter_on):
+    return PF_RULES_TEXT + (FILTER_RULES_TEXT if filter_on else "")
+
+
 PF_ANCHOR_LINES = [
     'anchor "guardian-angel"',
     'load anchor "guardian-angel" from "%s"' % (PREFIX + "/usr/local/guardian-angel/pf.rules"),
@@ -122,7 +138,7 @@ def save_json(path, data, mode=0o644):
     os.replace(tmp, path)
 
 
-DEFAULT_CONFIG = {"domains": [], "emergency_delay_hours": 24}
+DEFAULT_CONFIG = {"domains": [], "emergency_delay_hours": 24, "filter": False}
 DEFAULT_STATE = {"armed": False, "pause_until": None, "emergency_at": None, "last_fail": 0}
 
 
@@ -305,9 +321,20 @@ def ensure_hosts(domains, active):
     return True
 
 
-def ensure_pf(active):
+def ensure_pf(active, filter_on=False):
     if TESTING:
         return
+    desired = pf_rules_text(filter_on)
+    try:
+        with open(PF_RULES) as f:
+            on_disk = f.read()
+    except FileNotFoundError:
+        on_disk = ""
+    rules_changed = on_disk != desired
+    if rules_changed:
+        os.makedirs(INSTALL_DIR, exist_ok=True)
+        with open(PF_RULES, "w") as f:
+            f.write(desired)
     try:
         with open(PF_CONF) as f:
             conf = f.read()
@@ -321,14 +348,38 @@ def ensure_pf(active):
         log("pf.conf anchor lines restored")
     if active:
         run(["pfctl", "-E"])
-        # anchor empty (flushed by hand)? reload it
+        # anchor empty (flushed by hand) or rules stale? reload it
         r = subprocess.run(["pfctl", "-a", "guardian-angel", "-sr"],
                            capture_output=True, text=True)
-        if not r.stdout.strip():
+        if rules_changed or not r.stdout.strip():
             run(["pfctl", "-a", "guardian-angel", "-f", PF_RULES])
-            log("pf anchor reloaded")
+            log("pf anchor reloaded (filter %s)" % ("on" if filter_on else "off"))
     else:
         run(["pfctl", "-a", "guardian-angel", "-F", "rules"])
+
+
+def network_services():
+    r = subprocess.run(["networksetup", "-listallnetworkservices"],
+                       capture_output=True, text=True)
+    # first line is a legend; a leading "*" marks a disabled service
+    return [l.lstrip("*").strip() for l in r.stdout.splitlines()[1:] if l.strip()]
+
+
+def ensure_dns_pin(pin):
+    """Pin every network service's DNS to Cloudflare Family, or release a
+    pin that is ours. Never clobbers DNS servers we didn't set."""
+    if TESTING:
+        return
+    for svc in network_services():
+        r = subprocess.run(["networksetup", "-getdnsservers", svc],
+                           capture_output=True, text=True)
+        current = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+        if pin and current != FAMILY_DNS:
+            run(["networksetup", "-setdnsservers", svc] + FAMILY_DNS)
+            log("dns pinned to Cloudflare Family (%s)" % svc)
+        elif not pin and current == FAMILY_DNS:
+            run(["networksetup", "-setdnsservers", svc, "Empty"])
+            log("dns pin released (%s)" % svc)
 
 
 def ensure_plist():
@@ -353,8 +404,10 @@ def enforce_once():
     config, state = load_all()
     settle(config, state)
     active = is_active(state)
+    filtering = active and config.get("filter", False)
     ensure_hosts(config["domains"], active)
-    ensure_pf(active)
+    ensure_pf(active, filtering)
+    ensure_dns_pin(filtering)
     ensure_plist()
     return config, state
 
@@ -448,6 +501,8 @@ def cmd_status(args):
     print("guardian: %s" % mode)
     print("blocked domains (%d): %s" % (
         len(config["domains"]), ", ".join(sorted(config["domains"])) or "—"))
+    print("nsfw filter: %s" % (
+        "on (Cloudflare Family DNS)" if config.get("filter") else "off"))
     left = codes_remaining()
     if left is None:
         print("unlock codes remaining: (visible with sudo)")
@@ -555,6 +610,31 @@ def cmd_delay(args):
         args[0], "" if secs >= current else " — shorter hatch, weaker guardian; your call"))
 
 
+def cmd_filter(args):
+    if not args or args[0] not in ("on", "off"):
+        die("usage: guardian filter <on|off>")
+    need_root()
+    config, state = load_all()
+    want = args[0] == "on"
+    if config.get("filter", False) == want:
+        print("nsfw filter is already %s" % args[0])
+        return
+    if not want and is_active(state):
+        # Same asymmetry as everything else: on = tightening, off = loosening.
+        require_code("turn the nsfw filter off")
+    config["filter"] = want
+    save_json(CONFIG, config)
+    enforce_once()
+    if want:
+        print("nsfw filter ON — DNS pinned to Cloudflare Family (1.1.1.3); "
+              "all other resolvers blocked.")
+        if not is_active(state):
+            print("(enforced once you `guardian arm`)")
+        print("note: captive portals (hotel/café wi-fi) may need `guardian pause` to log in")
+    else:
+        print("nsfw filter off — DNS back to DHCP defaults")
+
+
 def cmd_emergency(args):
     need_root()
     config, state = load_all()
@@ -626,7 +706,7 @@ def cmd_install(args):
     shutil.copyfile(os.path.abspath(__file__), os.path.join(INSTALL_DIR, "guardian.py"))
     os.chmod(os.path.join(INSTALL_DIR, "guardian.py"), 0o755)
     with open(PF_RULES, "w") as f:
-        f.write(PF_RULES_TEXT)
+        f.write(pf_rules_text(load_json(CONFIG, DEFAULT_CONFIG).get("filter", False)))
     with open(CANONICAL_PLIST, "wb") as f:
         plistlib.dump(plist_dict(), f)
     shutil.copyfile(CANONICAL_PLIST, PLIST)
@@ -640,6 +720,9 @@ def cmd_install(args):
         os.symlink(os.path.join(INSTALL_DIR, "guardian.py"), BIN_LINK)
         run(["launchctl", "bootstrap", "system", PLIST])
         run(["launchctl", "enable", "system/" + LABEL])
+        # -k restarts a daemon that was already running, so upgrades
+        # actually pick up the new code instead of the old process.
+        run(["launchctl", "kickstart", "-k", "system/" + LABEL])
     print("Installed. Daemon is running under launchd (KeepAlive).")
     print("Next: `guardian init` if you haven't, then add domains and `guardian arm`.")
 
@@ -661,6 +744,7 @@ def cmd_uninstall(args):
     rest, _ = split_hosts(read_hosts())
     write_hosts(rest, None)
     flush_dns()
+    ensure_dns_pin(False)
     if not TESTING:
         run(["pfctl", "-a", "guardian-angel", "-F", "all"])
         try:
@@ -690,6 +774,7 @@ COMMANDS = {
     "pause": cmd_pause,
     "emergency": cmd_emergency,
     "delay": cmd_delay,
+    "filter": cmd_filter,
     "init": cmd_init,
     "regen": cmd_regen,
     "install": cmd_install,
@@ -707,6 +792,7 @@ USAGE = """guardian — network-level site blocking with friend-held keys
   disarm                  enforcement off until re-armed         one code
   emergency [cancel]      no code — disarm lands after the delay time
   delay <30m|2h|24h>      set the emergency delay                raise free / lower one code
+  filter <on|off>         nsfw filter (Cloudflare Family DNS)    on free / off one code
   init | regen            create / rotate the one-time codes
   install | uninstall     manage the daemon (uninstall: DISARMED only)
 """

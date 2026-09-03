@@ -17,10 +17,15 @@ https://claude.ai/code/artifact/0c648624-b3b7-4af4-aae0-6dc8e8f37b84
   milliseconds. PF is re-checked on a 60s fallback timer.
 - Loosening anything requires a **one-time code held by a friend** (only
   salted SHA-256 hashes live on disk; codes burn on use).
-- The escape hatch never needs a code: `guardian emergency` disarms
-  **24 hours later**, cancelable anytime before.
+- Optional NSFW filter: `guardian filter on` pins macOS DNS to Cloudflare
+  Family (`1.1.1.3`, malware + adult categories, classified server-side) and
+  PF blocks every other resolver on port 53 — pointing DNS elsewhere fails
+  closed instead of bypassing the filter. Zero list maintenance.
+- The escape hatch never needs a code: `guardian emergency` disarms after a
+  configurable delay (default 24h, see `guardian delay`), cancelable anytime
+  before.
 
-Tightening is free. Loosening costs a code. Escaping costs a day.
+Tightening is free. Loosening costs a code. Escaping costs the delay.
 
 ## Install
 
@@ -40,7 +45,10 @@ guardian add news.ycombinator.com     # free — tightening never needs auth
 guardian pause 30m        # costs one code, auto re-arms
 guardian remove <domain>  # costs one code
 guardian disarm           # costs one code
-guardian emergency        # free — disarm lands in 24h; `emergency cancel` anytime
+guardian filter on        # NSFW filter via Cloudflare Family DNS — free to enable
+guardian filter off       # costs one code while armed
+guardian delay 30m        # emergency delay — raising is free, lowering costs a code
+guardian emergency        # free — disarm lands after the delay; `emergency cancel` anytime
 guardian regen            # rotate the code batch (costs a code while armed)
 guardian uninstall        # only from DISARMED
 ```
