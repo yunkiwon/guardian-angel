@@ -21,6 +21,12 @@ https://claude.ai/code/artifact/0c648624-b3b7-4af4-aae0-6dc8e8f37b84
   Family (`1.1.1.3`, malware + adult categories, classified server-side) and
   PF blocks every other resolver on port 53 — pointing DNS elsewhere fails
   closed instead of bypassing the filter. Zero list maintenance.
+- The service door: the daemon runs a CONNECT proxy on `127.0.0.1:8118` that
+  does its own DNS, so **CLI tools** (scrapers, yt-dlp, curl, other agents)
+  can reach blocked domains with `HTTPS_PROXY=http://127.0.0.1:8118` while
+  browsers stay walled — they use the system resolver, the daemon clears any
+  system proxy aimed at the door, and the door refuses Mozilla user-agents.
+  Nobody doomscrolls through curl; the ledger prices the rest.
 - The escape hatch never needs a code: `guardian emergency` disarms after a
   configurable delay (default 24h, see `guardian delay`), cancelable anytime
   before.
@@ -48,6 +54,7 @@ guardian disarm           # costs one code
 guardian filter on        # NSFW filter via Cloudflare Family DNS — free to enable
 guardian filter off       # costs one code while armed
 guardian delay 30m        # emergency delay — raising is free, lowering costs a code
+guardian door             # how CLI tools tunnel through (HTTPS_PROXY=http://127.0.0.1:8118)
 guardian emergency        # free — disarm lands after the delay; `emergency cancel` anytime
 guardian regen            # rotate the code batch (costs a code while armed)
 guardian uninstall        # only from DISARMED

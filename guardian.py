@@ -15,8 +15,11 @@ import re
 import secrets
 import select
 import shutil
+import socket
+import struct
 import subprocess
 import sys
+import threading
 import time
 
 # ---------------------------------------------------------------- paths
@@ -64,6 +67,13 @@ block return out quick proto tcp to <doh> port 443
 """
 
 FAMILY_DNS = ["1.1.1.3", "1.0.0.3", "2606:4700:4700::1113", "2606:4700:4700::1003"]
+
+# The service door: a localhost CONNECT proxy run by the daemon. It resolves
+# names itself (sidestepping the /etc/hosts sinkhole) and tunnels anywhere —
+# scrapers and CLI tools opt in via HTTPS_PROXY, while browsers stay on the
+# system resolver and hit the wall (and the door turns Mozillas away).
+# Nobody doomscrolls through curl; the ledger prices the rest.
+PROXY_PORT = 8118
 
 # Appended to pf.rules while the nsfw filter is on. The DNS pin in System
 # Settings makes name resolution *work*; these rules make it *mandatory* —
@@ -382,6 +392,23 @@ def ensure_dns_pin(pin):
             log("dns pin released (%s)" % svc)
 
 
+def ensure_no_sys_proxy(active):
+    """Browsers honor the *system* proxy — don't let one be pointed at our
+    own service door."""
+    if TESTING or not active:
+        return
+    for svc in network_services():
+        for get_cmd, set_cmd in (("-getwebproxy", "-setwebproxystate"),
+                                 ("-getsecurewebproxy", "-setsecurewebproxystate")):
+            r = subprocess.run(["networksetup", get_cmd, svc],
+                               capture_output=True, text=True)
+            out = r.stdout
+            if ("Enabled: Yes" in out and "127.0.0.1" in out
+                    and str(PROXY_PORT) in out):
+                run(["networksetup", set_cmd, svc, "off"])
+                log("system proxy aimed at the service door — cleared (%s)" % svc)
+
+
 def ensure_plist():
     """Restore our launchd plist from the canonical copy if tampered with."""
     if not os.path.exists(CANONICAL_PLIST):
@@ -408,8 +435,169 @@ def enforce_once():
     ensure_hosts(config["domains"], active)
     ensure_pf(active, filtering)
     ensure_dns_pin(filtering)
+    ensure_no_sys_proxy(active)
     ensure_plist()
     return config, state
+
+
+# ---------------------------------------------------------------- service door
+
+
+def _skip_name(data, i):
+    while i < len(data):
+        b = data[i]
+        if b == 0:
+            return i + 1
+        if b & 0xC0:  # compression pointer
+            return i + 2
+        i += b + 1
+    return i
+
+
+def dns_resolve(host, server):
+    """Minimal A-record lookup straight to `server`, bypassing the system
+    resolver — and therefore the /etc/hosts sinkhole. Plain port 53, which
+    our own PF rules always leave open to the resolver in use."""
+    tid = secrets.randbelow(65536)
+    q = struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0)
+    for part in host.split("."):
+        q += bytes([len(part)]) + part.encode()
+    q += b"\x00" + struct.pack(">HH", 1, 1)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.settimeout(3)
+        s.sendto(q, (server, 53))
+        data, _ = s.recvfrom(2048)
+    except OSError:
+        return []
+    finally:
+        s.close()
+    if len(data) < 12 or data[:2] != q[:2]:
+        return []
+    ancount = struct.unpack(">H", data[6:8])[0]
+    i = _skip_name(data, 12) + 4  # question: name + qtype + qclass
+    addrs = []
+    for _ in range(ancount):
+        i = _skip_name(data, i)
+        if i + 10 > len(data):
+            break
+        rtype, _, _, rdlen = struct.unpack(">HHIH", data[i:i + 10])
+        i += 10
+        if rtype == 1 and rdlen == 4:
+            addrs.append(".".join(str(b) for b in data[i:i + 4]))
+        i += rdlen
+    return addrs
+
+
+def _refuse(conn, status, msg):
+    body = msg + "\n"
+    conn.sendall(("HTTP/1.1 %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s"
+                  % (status, len(body), body)).encode())
+
+
+def _pipe(src, dst):
+    try:
+        while True:
+            data = src.recv(65536)
+            if not data:
+                break
+            dst.sendall(data)
+    except OSError:
+        pass
+    finally:
+        for s in (src, dst):
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
+def proxy_handle(conn):
+    up = None
+    try:
+        conn.settimeout(15)
+        req = b""
+        while b"\r\n\r\n" not in req and len(req) < 8192:
+            chunk = conn.recv(4096)
+            if not chunk:
+                return
+            req += chunk
+        head, _, extra = req.partition(b"\r\n\r\n")
+        head = head.decode("latin1", "replace")
+        parts = head.split("\r\n", 1)[0].split()
+        if len(parts) != 3 or parts[0] != "CONNECT":
+            _refuse(conn, "405 Method Not Allowed", "guardian door: CONNECT (https) only")
+            return
+        # Browsers announce themselves in CONNECT headers; the door is for
+        # CLI tools. Spoofable on purpose — see the threat ledger.
+        if re.search(r"^user-agent:.*mozilla", head, re.I | re.M):
+            _refuse(conn, "403 Forbidden", "guardian door: browsers keep hitting the wall")
+            return
+        host, sep, port = parts[1].rpartition(":")
+        if not sep:
+            host, port = parts[1], "443"
+        try:
+            port = int(port)
+        except ValueError:
+            _refuse(conn, "400 Bad Request", "guardian door: bad CONNECT target")
+            return
+        host = host.strip("[]").lower().rstrip(".")
+        config, state = load_all()
+        if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", host):
+            addrs = [host]
+        else:
+            # With the nsfw filter on, the door resolves through Cloudflare
+            # Family too — it can't reach what the filter wouldn't. The
+            # fallback covers a config/PF mismatch mid-toggle; when the
+            # filter's PF rules are up, only the family resolver is
+            # reachable anyway, so this can't relax the filter.
+            filtering = is_active(state) and config.get("filter")
+            order = [FAMILY_DNS[0], "1.1.1.1"] if filtering else ["1.1.1.1", FAMILY_DNS[0]]
+            addrs = dns_resolve(host, order[0]) or dns_resolve(host, order[1])
+        if not addrs or addrs[0] == "0.0.0.0":
+            _refuse(conn, "502 Bad Gateway", "guardian door: could not resolve %s" % host)
+            return
+        try:
+            up = socket.create_connection((addrs[0], port), timeout=10)
+        except OSError as e:
+            _refuse(conn, "502 Bad Gateway", "guardian door: connect failed (%s)" % e)
+            return
+        conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        if extra:
+            up.sendall(extra)
+        conn.settimeout(None)
+        up.settimeout(None)
+        t = threading.Thread(target=_pipe, args=(conn, up), daemon=True)
+        t.start()
+        _pipe(up, conn)
+        t.join(timeout=5)
+    except OSError:
+        pass
+    finally:
+        for s in (conn, up):
+            if s is not None:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+
+
+def proxy_serve():
+    try:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", PROXY_PORT))
+        srv.listen(16)
+    except OSError as e:
+        log("service door failed to bind 127.0.0.1:%d (%s)" % (PROXY_PORT, e))
+        return
+    log("service door listening on 127.0.0.1:%d" % PROXY_PORT)
+    while True:
+        try:
+            conn, _ = srv.accept()
+        except OSError:
+            continue
+        threading.Thread(target=proxy_handle, args=(conn,), daemon=True).start()
 
 
 # ---------------------------------------------------------------- daemon
@@ -462,6 +650,8 @@ def kqueue_wait(timeout):
 def cmd_daemon(args):
     once = "--once" in args
     log("guardiand starting (pid %d)%s" % (os.getpid(), " [test]" if TESTING else ""))
+    if not once:
+        threading.Thread(target=proxy_serve, daemon=True).start()
     while True:
         config, state = enforce_once()
         if once:
@@ -503,6 +693,7 @@ def cmd_status(args):
         len(config["domains"]), ", ".join(sorted(config["domains"])) or "—"))
     print("nsfw filter: %s" % (
         "on (Cloudflare Family DNS)" if config.get("filter") else "off"))
+    print("service door: 127.0.0.1:%d (CLI only — `guardian door`)" % PROXY_PORT)
     left = codes_remaining()
     if left is None:
         print("unlock codes remaining: (visible with sudo)")
@@ -608,6 +799,15 @@ def cmd_delay(args):
     save_json(CONFIG, config)
     print("emergency delay is now %s%s" % (
         args[0], "" if secs >= current else " — shorter hatch, weaker guardian; your call"))
+
+
+def cmd_door(args):
+    print("service door: http://127.0.0.1:%d — a CONNECT proxy the daemon runs" % PROXY_PORT)
+    print("CLI tools go through the wall with one env var:")
+    print("  HTTPS_PROXY=http://127.0.0.1:%d yt-dlp <url>" % PROXY_PORT)
+    print("  HTTPS_PROXY=http://127.0.0.1:%d curl https://reddit.com/" % PROXY_PORT)
+    print("browsers stay walled: they use the system resolver, the daemon clears")
+    print("any system proxy aimed at the door, and the door refuses Mozilla UAs.")
 
 
 def cmd_filter(args):
@@ -775,6 +975,7 @@ COMMANDS = {
     "emergency": cmd_emergency,
     "delay": cmd_delay,
     "filter": cmd_filter,
+    "door": cmd_door,
     "init": cmd_init,
     "regen": cmd_regen,
     "install": cmd_install,
@@ -793,6 +994,7 @@ USAGE = """guardian — network-level site blocking with friend-held keys
   emergency [cancel]      no code — disarm lands after the delay time
   delay <30m|2h|24h>      set the emergency delay                raise free / lower one code
   filter <on|off>         nsfw filter (Cloudflare Family DNS)    on free / off one code
+  door                    how terminals get through the wall     info
   init | regen            create / rotate the one-time codes
   install | uninstall     manage the daemon (uninstall: DISARMED only)
 """
